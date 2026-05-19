@@ -38,55 +38,57 @@ class FetchLog(db.Model):
 with app.app_context():
     db.create_all()
 
-def fetch_trending():
-    with app.app_context():
-        headers = {'Accept': 'application/vnd.github.v3+json'}
-        github_token = os.environ.get('GITHUB_TOKEN')
-        if github_token:
-            headers['Authorization'] = f'token {github_token}'
+def _do_fetch():
+    from datetime import timedelta
+    headers = {'Accept': 'application/vnd.github.v3+json'}
+    github_token = os.environ.get('GITHUB_TOKEN')
+    if github_token:
+        headers['Authorization'] = f'token {github_token}'
 
-        # Fetch repos created in the last 30 days, sorted by stars
-        from datetime import timedelta
-        since = (datetime.utcnow() - timedelta(days=30)).strftime('%Y-%m-%d')
-        url = f'https://api.github.com/search/repositories?q=created:>{since}+stars:>10&sort=stars&order=desc&per_page=50'
+    since = (datetime.utcnow() - timedelta(days=30)).strftime('%Y-%m-%d')
+    api_url = f'https://api.github.com/search/repositories?q=created:>{since}+stars:>10&sort=stars&order=desc&per_page=50'
 
-        try:
-            resp = requests.get(url, headers=headers, timeout=15)
-            resp.raise_for_status()
-            items = resp.json().get('items', [])
-        except Exception as e:
-            db.session.add(FetchLog(status='error', message=str(e)[:200]))
-            db.session.commit()
-            return
-
-        added = updated = 0
-        for item in items:
-            existing = Repo.query.filter_by(github_id=item['id']).first()
-            if existing:
-                existing.stars = item['stargazers_count']
-                existing.forks = item['forks_count']
-                existing.last_seen = datetime.utcnow()
-                updated += 1
-            else:
-                db.session.add(Repo(
-                    github_id=item['id'],
-                    name=item['name'],
-                    full_name=item['full_name'],
-                    description=item.get('description') or '',
-                    url=item['html_url'],
-                    stars=item['stargazers_count'],
-                    forks=item['forks_count'],
-                    language=item.get('language') or 'Unknown',
-                    repo_created_at=item['created_at'][:10],
-                ))
-                added += 1
-
-        db.session.add(FetchLog(repos_added=added, repos_updated=updated))
+    try:
+        resp = requests.get(api_url, headers=headers, timeout=15)
+        resp.raise_for_status()
+        items = resp.json().get('items', [])
+    except Exception as e:
+        db.session.add(FetchLog(status='error', message=str(e)[:200]))
         db.session.commit()
+        return
 
-# Background scheduler — runs fetch_trending every hour automatically
+    added = updated = 0
+    for item in items:
+        existing = Repo.query.filter_by(github_id=item['id']).first()
+        if existing:
+            existing.stars = item['stargazers_count']
+            existing.forks = item['forks_count']
+            existing.last_seen = datetime.utcnow()
+            updated += 1
+        else:
+            db.session.add(Repo(
+                github_id=item['id'],
+                name=item['name'],
+                full_name=item['full_name'],
+                description=item.get('description') or '',
+                url=item['html_url'],
+                stars=item['stargazers_count'],
+                forks=item['forks_count'],
+                language=item.get('language') or 'Unknown',
+                repo_created_at=item['created_at'][:10],
+            ))
+            added += 1
+
+    db.session.add(FetchLog(repos_added=added, repos_updated=updated))
+    db.session.commit()
+
+def scheduled_fetch():
+    with app.app_context():
+        _do_fetch()
+
+# Background scheduler — runs every hour automatically
 scheduler = BackgroundScheduler()
-scheduler.add_job(fetch_trending, 'interval', hours=1, id='fetch_job')
+scheduler.add_job(scheduled_fetch, 'interval', hours=1, id='fetch_job')
 scheduler.start()
 
 @app.route('/')
@@ -136,8 +138,8 @@ def index():
 
 @app.route('/fetch', methods=['POST'])
 def manual_fetch():
-    fetch_trending()
-    return redirect(url_for('index'))
+    _do_fetch()
+    return redirect('/')
 
 if __name__ == '__main__':
     app.run(debug=True)
